@@ -4,11 +4,14 @@ import os
 import socket
 import shutil
 import argparse
+import json
+import time
 
 import donkeycar as dk
 from donkeycar.parts.datastore import Tub
+from donkeycar.utils import *
 from .tub import TubManager
-
+from .joystick_creator import CreateJoystick
 
 PACKAGE_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 TEMPLATES_PATH = os.path.join(PACKAGE_PATH, 'templates')
@@ -42,7 +45,7 @@ def load_config(config_path):
     return cfg
 
 
-class BaseCommand():
+class BaseCommand(object):
     pass
 
 
@@ -85,8 +88,10 @@ class CreateCar(BaseCommand):
         #add car application and config files if they don't exist
         app_template_path = os.path.join(TEMPLATES_PATH, template+'.py')
         config_template_path = os.path.join(TEMPLATES_PATH, 'config_defaults.py')
+        train_template_path = os.path.join(TEMPLATES_PATH, 'train.py')
         car_app_path = os.path.join(path, 'manage.py')
         car_config_path = os.path.join(path, 'config.py')
+        train_app_path = os.path.join(path, 'train.py')
         
         if os.path.exists(car_app_path) and not overwrite:
             print('Car app already exists. Delete it and rerun createcar to replace.')
@@ -99,6 +104,12 @@ class CreateCar(BaseCommand):
         else:
             print("Copying car config defaults. Adjust these before starting your car.")
             shutil.copyfile(config_template_path, car_config_path)
+ 
+        if os.path.exists(train_app_path) and not overwrite:
+            print('Train already exists. Delete it and rerun createcar to replace.')
+        else:
+            print("Copying train script. Adjust these before starting your car.")
+            shutil.copyfile(train_template_path, train_app_path)
  
         print("Donkey setup complete.")
 
@@ -141,6 +152,8 @@ class CalibrateCar(BaseCommand):
     def parse_args(self, args):
         parser = argparse.ArgumentParser(prog='calibrate', usage='%(prog)s [options]')
         parser.add_argument('--channel', help='The channel youd like to calibrate [0-15]')
+        parser.add_argument('--address', default='0x40', help='The i2c address youd like to calibrate [default 0x40]')
+        parser.add_argument('--bus', default=None, help='The i2c bus youd like to calibrate [default autodetect]')
         parsed_args = parser.parse_args(args)
         return parsed_args
 
@@ -149,7 +162,12 @@ class CalibrateCar(BaseCommand):
     
         args = self.parse_args(args)
         channel = int(args.channel)
-        c = PCA9685(channel)
+        busnum = None
+        if args.bus:
+            busnum = int(args.bus)
+        address = int(args.address, 16)
+        print('init PCA9685 on channel %d address %s bus %s' %(channel, str(hex(address)), str(busnum)))
+        c = PCA9685(channel, address=address, busnum=busnum)
         
         for i in range(10):
             pmw = int(input('Enter a PWM setting to test(0-1500)'))
@@ -163,6 +181,8 @@ class MakeMovie(BaseCommand):
         parser.add_argument('--tub', help='The tub to make movie from')
         parser.add_argument('--out', default='tub_movie.mp4', help='The movie filename to create. default: tub_movie.mp4')
         parser.add_argument('--config', default='./config.py', help='location of config file to use. default: ./config.py')
+        parser.add_argument('--model', default='None', help='the model to use to show control outputs')
+        parser.add_argument('--model_type', default='categorical', help='the model type to load')
         parsed_args = parser.parse_args(args)
         return parsed_args, parser
 
@@ -196,12 +216,45 @@ class MakeMovie(BaseCommand):
         self.tub = Tub(args.tub)
         self.num_rec = self.tub.get_num_records()
         self.iRec = 0
+        self.keras_part = None
+        if not args.model == "None":
+            self.keras_part = get_model_by_type(args.model_type, cfg=cfg)
+            self.keras_part.load(args.model)
+            self.keras_part.compile()
 
         print('making movie', args.out, 'from', self.num_rec, 'images')
         clip = mpy.VideoClip(self.make_frame, duration=(self.num_rec//cfg.DRIVE_LOOP_HZ) - 1)
         clip.write_videofile(args.out,fps=cfg.DRIVE_LOOP_HZ)
 
         print('done')
+
+    def draw_model_prediction(self, record, img):
+        '''
+        query the model for it's prediction, draw the user input and the predictions
+        as green and blue lines on the image
+        '''
+        if self.keras_part is None:
+            return
+
+        import cv2
+         
+        user_angle = float(record["user/angle"])
+        user_throttle = float(record["user/throttle"])
+        pilot_angle, pilot_throttle = self.keras_part.run(img)
+
+        a1 = user_angle * 45.0
+        l1 = user_throttle * 3.0 * 80.0
+        a2 = pilot_angle * 45.0
+        l2 = pilot_throttle * 3.0 * 80.0
+
+        p1 = tuple((74, 119))
+        p2 = tuple((84, 119))
+        p11 = tuple(( int(p1[0] + l1 * math.cos((a1 + 270.0) * math.pi / 180.0)), int(p1[1] + l1 * math.sin((a1 + 270.0) * math.pi / 180.0))))
+        p22 = tuple(( int(p2[0] + l2 * math.cos((a2 + 270.0) * math.pi / 180.0)), int(p2[1] + l2 * math.sin((a2 + 270.0) * math.pi / 180.0))))
+
+        cv2.line(img, p1, p11, (0, 255, 0), 2)
+        cv2.line(img, p2, p22, (0, 0, 255), 2)
+
 
     def make_frame(self, t):
         '''
@@ -217,6 +270,8 @@ class MakeMovie(BaseCommand):
 
         rec = self.tub.get_record(self.iRec)
         image = rec['cam/image_array']
+
+        self.draw_model_prediction(rec, image)
         
         return image # returns a 8-bit RGB array
 
@@ -253,13 +308,13 @@ class Sim(BaseCommand):
         if cfg is None:
             return
 
-        #TODO: this logic should be in a pilot or modle handler part.
+        #TODO: this logic should be in a pilot or model handler part.
         if args.type == "categorical":
             kl = KerasCategorical()
         elif args.type == "linear":
             kl = KerasLinear(num_outputs=2)
         else:
-            print("didn't recognice type:", args.type)
+            print("didn't recognize type:", args.type)
             return
 
         #can provide an optional image filter part
@@ -294,10 +349,12 @@ class TubCheck(BaseCommand):
     def parse_args(self, args):
         parser = argparse.ArgumentParser(prog='tubcheck', usage='%(prog)s [options]')
         parser.add_argument('tubs', nargs='+', help='paths to tubs')
+        parser.add_argument('--fix', action='store_true', help='remove problem records')
+        parser.add_argument('--delete_empty', action='store_true', help='delete tub dir with no records')
         parsed_args = parser.parse_args(args)
         return parsed_args
 
-    def check(self, tub_paths, fix=False):
+    def check(self, tub_paths, fix=False, delete_empty=False):
         '''
         Check for any problems. Looks at tubs and find problems in any records or images that won't open.
         If fix is True, then delete images and records that cause problems.
@@ -306,17 +363,21 @@ class TubCheck(BaseCommand):
 
         for tub in tubs:
             tub.check(fix=fix)
+            if delete_empty and tub.get_num_records() == 0:
+                import shutil
+                print("removing empty tub", tub.path)
+                shutil.rmtree(tub.path)
 
     def run(self, args):
         args = self.parse_args(args)
-        self.check(args.tubs)
+        self.check(args.tubs, args.fix, args.delete_empty)
 
 
 class ShowHistogram(BaseCommand):
 
     def parse_args(self, args):
         parser = argparse.ArgumentParser(prog='tubhist', usage='%(prog)s [options]')
-        parser.add_argument('tubs', nargs='+', help='paths to tubs')
+        parser.add_argument('--tub', nargs='+', help='paths to tubs')
         parser.add_argument('--record', default=None, help='name of record to create histogram')
         parsed_args = parser.parse_args(args)
         return parsed_args
@@ -333,60 +394,126 @@ class ShowHistogram(BaseCommand):
             tg.df[record_name].hist(bins=50)
         else:
             tg.df.hist(bins=50)
+
+        plt.savefig(os.path.basename(model_path) + '_hist_%s.png' % record_name)
         plt.show()
 
     def run(self, args):
         args = self.parse_args(args)
-        args.tubs = ','.join(args.tubs)
-        self.show_histogram(args.tubs, args.record)
+        args.tub = ','.join(args.tub)
+        self.show_histogram(args.tub, args.record)
+
+
+class ConSync(BaseCommand):
+    '''
+    continuously rsync data
+    '''
+    
+    def parse_args(self, args):
+        parser = argparse.ArgumentParser(prog='consync', usage='%(prog)s [options]')
+        parser.add_argument('--dir', default='./cont_data/', help='paths to tubs')
+        parser.add_argument('--delete', default='y', help='remove files locally that were deleted remotely y=yes n=no')
+        parsed_args = parser.parse_args(args)
+        return parsed_args
+
+    def run(self, args):
+        args = self.parse_args(args)
+        cfg = load_config('config.py')
+        dest_dir = args.dir
+        del_arg = ""
+
+        if args.delete == 'y':
+            reply = input('WARNING:this rsync operation will delete data in the target dir: %s. ok to proceeed? [y/N]: ' % dest_dir)
+
+            if reply != 'y' and reply != "Y":
+                return
+            del_arg = "--delete"
+
+        if not dest_dir[-1] == '/' and not dest_dir[-1] == '\\':
+            print("Desination dir should end with a /")
+            return
+
+        try:
+            os.mkdir(dest_dir)
+        except:
+            pass
+
+        while True:
+            command = "rsync -aW --progress %s@%s:%s/data/ %s %s" %\
+                (cfg.PI_USERNAME, cfg.PI_HOSTNAME, cfg.PI_DONKEY_ROOT, dest_dir, del_arg)
+
+            os.system(command)
+            time.sleep(5)
+
+class ConTrain(BaseCommand):
+    '''
+    continuously train data
+    '''
+    
+    def parse_args(self, args):
+        parser = argparse.ArgumentParser(prog='contrain', usage='%(prog)s [options]')
+        parser.add_argument('--tub', default='./cont_data/*', help='paths to tubs')
+        parser.add_argument('--model', default='./models/drive.h5', help='path to model')
+        parser.add_argument('--transfer', default=None, help='path to transfer model')
+        parser.add_argument('--type', default='categorical', help='type of model (linear|categorical|rnn|imu|behavior|3d)')
+        parser.add_argument('--aug', action="store_true", help='perform image augmentation')        
+        parsed_args = parser.parse_args(args)
+        return parsed_args
+
+    def run(self, args):
+        args = self.parse_args(args)
+        cfg = load_config('config.py')
+        import sys
+        sys.path.append('.')
+        from train import multi_train
+        continuous = True
+        multi_train(cfg, args.tub, args.model, args.transfer, args.type, continuous, args.aug)
 
 
 class ShowPredictionPlots(BaseCommand):
 
-    def plot_predictions(cfg, tub_paths, model_path):
+    def plot_predictions(self, cfg, tub_paths, model_path, limit, model_type):
         '''
         Plot model predictions for angle and throttle against data from tubs.
 
         '''
         import matplotlib.pyplot as plt
         import pandas as pd
-        from donkeycar.parts.datastore import TubGroup
-        from donkeycar.parts.keras import KerasCategorical
-
-        tg = TubGroup(tub_paths)
 
         model_path = os.path.expanduser(model_path)
-        model = KerasCategorical()
+        model = dk.utils.get_model_by_type(model_type, cfg)
         model.load(model_path)
 
-        gen = tg.get_batch_gen(batch_size=len(tg.df),shuffle=False)
-        arr = next(gen)
+        records = gather_records(cfg, tub_paths)
+        user_angles = []
+        user_throttles = []
+        pilot_angles = []
+        pilot_throttles = []       
 
-        """
-        THIS WILL SHOW the output of a predicted model.
-        
-        
-        for tub in tubs:
-            num_records = tub.get_num_records()
-            for iRec in tub.get_index(shuffled=False):
-                record = tub.get_record(iRec)
+        records = records[:limit]
+        num_records = len(records)
+        print('processing %d records:' % num_records)
 
-                img = record["cam/image_array"]
-                user_angle = float(record["user/angle"])
-                user_throttle = float(record["user/throttle"])
-                pilot_angle, pilot_throttle = model.run(img)
+        for record_path in records:
+            with open(record_path, 'r') as fp:
+                record = json.load(fp)
+            img_filename = os.path.join(tub_paths, record['cam/image_array'])
+            img = load_scaled_image_arr(img_filename, cfg)
+            user_angle = float(record["user/angle"])
+            user_throttle = float(record["user/throttle"])
+            pilot_angle, pilot_throttle = model.run(img)
 
-                user_angles.append(user_angle)
-                user_throttles.append(user_throttle)
-                pilot_angles.append(pilot_angle)
-                pilot_throttles.append(pilot_throttle)
+            user_angles.append(user_angle)
+            user_throttles.append(user_throttle)
+            pilot_angles.append(pilot_angle)
+            pilot_throttles.append(pilot_throttle)
 
         angles_df = pd.DataFrame({'user_angle': user_angles, 'pilot_angle': pilot_angles})
         throttles_df = pd.DataFrame({'user_throttle': user_throttles, 'pilot_throttle': pilot_throttles})
 
         fig = plt.figure()
 
-        title = "Model Predictions\nTubs: " + tub_names + "\nModel: " + model_name
+        title = "Model Predictions\nTubs: " + tub_paths + "\nModel: " + model_path
         fig.suptitle(title)
 
         ax1 = fig.add_subplot(211)
@@ -398,8 +525,25 @@ class ShowPredictionPlots(BaseCommand):
         ax1.legend(loc=4)
         ax2.legend(loc=4)
 
+        plt.savefig(model_path + '_pred.png')
         plt.show()
-        """
+
+    def parse_args(self, args):
+        parser = argparse.ArgumentParser(prog='tubplot', usage='%(prog)s [options]')
+        parser.add_argument('--tub', nargs='+', help='paths to tubs')
+        parser.add_argument('--model', default=None, help='name of record to create histogram')
+        parser.add_argument('--limit', default=1000, help='how many records to process')
+        parser.add_argument('--type', default='categorical', help='how many records to process')
+        parser.add_argument('--config', default='./config.py', help='location of config file to use. default: ./config.py')
+        parsed_args = parser.parse_args(args)
+        return parsed_args
+
+    def run(self, args):
+        args = self.parse_args(args)
+        args.tub = ','.join(args.tub)
+        cfg = load_config(args.config)
+        self.plot_predictions(cfg, args.tub, args.model, args.limit, args.type)
+        
 
 def execute_from_command_line():
     """
@@ -413,15 +557,17 @@ def execute_from_command_line():
             'tubhist': ShowHistogram,
             'tubplot': ShowPredictionPlots,
             'tubcheck': TubCheck,
-            'makemovie': MakeMovie,
+            'makemovie': MakeMovie,            
             'sim': Sim,
+            'createjs': CreateJoystick,
+            'consync': ConSync,
+            'contrain': ConTrain,
                 }
     
     args = sys.argv[:]
-    command_text = args[1]
-    
-    if command_text in commands.keys():
-        command = commands[command_text]
+
+    if len(args) > 1 and args[1] in commands.keys():
+        command = commands[args[1]]
         c = command()
         c.run(args[2:])
     else:

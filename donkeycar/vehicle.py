@@ -83,7 +83,7 @@ class Vehicle():
 
             #wait until the parts warm up.
             print('Starting vehicle...')
-            time.sleep(1)
+            #time.sleep(1)
 
             loop_count = 0
             while self.on:
@@ -142,4 +142,4 @@ class Vehicle():
                 entry['part'].shutdown()
             except Exception as e:
                 print(e)
-        print(self.mem.d)
+        #print(self.mem.d)
