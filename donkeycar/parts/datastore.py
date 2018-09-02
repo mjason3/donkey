@@ -152,7 +152,7 @@ class Tub(object):
     def __init__(self, path, inputs=None, types=None):
 
         self.path = os.path.expanduser(path)
-        print('path_in_tub:', self.path)
+        #print('path_in_tub:', self.path)
         self.meta_path = os.path.join(self.path, 'meta.json')
         self.df = None
 
@@ -160,10 +160,17 @@ class Tub(object):
 
         if exists:
             #load log and meta
-            print("Tub exists: {}".format(self.path))
-            with open(self.meta_path, 'r') as f:
-                self.meta = json.load(f)
-            self.current_ix = self.get_last_ix() + 1
+            #print("Tub exists: {}".format(self.path))
+            try:
+                with open(self.meta_path, 'r') as f:
+                    self.meta = json.load(f)
+            except FileNotFoundError:
+                self.meta = {'inputs': [], 'types': []}
+
+            try:
+                self.current_ix = self.get_last_ix() + 1
+            except ValueError:
+                self.current_ix = 0
 
         elif not exists and inputs:
             print('Tub does NOT exist. Creating new tub...')
@@ -184,7 +191,7 @@ class Tub(object):
 
 
     def get_last_ix(self):
-        index = self.get_index()
+        index = self.get_index()           
         return max(index)
 
     def update_df(self):
@@ -307,7 +314,7 @@ class Tub(object):
         for key, val in data.items():
             typ = self.get_input_type(key)
 
-            if typ in ['str', 'float', 'int', 'boolean']:
+            if typ in ['str', 'float', 'int', 'boolean', 'vector']:
                 json_data[key] = val
 
             elif typ is 'image':
@@ -327,6 +334,27 @@ class Tub(object):
 
         self.write_json_record(json_data)
         return self.current_ix
+
+    def erase_last_n_records(self, num_erase):
+        '''
+        erase N records from the disc and move current back accordingly
+        '''
+        last_erase = self.current_ix
+        first_erase = last_erase - num_erase
+        self.current_ix = first_erase - 1
+        if self.current_ix < 0:
+            self.current_ix = 0
+
+        for i in range(first_erase, last_erase):
+            if i < 0:
+                continue
+            json_path = self.get_json_record_path(i)
+            if os.path.exists(json_path):
+                os.unlink(json_path)
+            img_filename = '%d_cam-image_array_.jpg' % (i)
+            img_path = os.path.join(self.path, img_filename)
+            if os.path.exists(img_path):
+                os.unlink(img_path)
 
 
     def get_json_record_path(self, ix):
@@ -472,6 +500,7 @@ class TubWriter(Tub):
         self.record_time = int(time.time() - self.start_time)
         record = dict(zip(self.inputs, args))
         self.put_record(record)
+        return self.current_ix
 
 
 class TubReader(Tub):
@@ -642,8 +671,8 @@ class TubTimeStacker(TubImageStacker):
 
 
 class TubGroup(Tub):
-    def __init__(self, tub_paths_arg):
-        tub_paths = utils.expand_path_arg(tub_paths_arg)
+    def __init__(self, tub_paths):
+        tub_paths = self.resolve_tub_paths(tub_paths)
         print('TubGroup:tubpaths:', tub_paths)
         tubs = [Tub(path) for path in tub_paths]
         self.input_types = {}
@@ -664,3 +693,20 @@ class TubGroup(Tub):
         self.df = pd.concat([t.df for t in tubs], axis=0, join='inner')
 
 
+
+    def find_tub_paths(self, path):
+        matches = []
+        path = os.path.expanduser(path)
+        for file in glob.glob(path):
+            if os.path.isdir(file):
+                matches.append(os.path.join(os.path.abspath(file)))
+        return matches
+
+
+    def resolve_tub_paths(self, path_list):
+        path_list = path_list.split(",")
+        resolved_paths = []
+        for path in path_list:
+            paths = self.find_tub_paths(path)
+            resolved_paths += paths
+        return resolved_paths

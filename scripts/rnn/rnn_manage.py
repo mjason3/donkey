@@ -4,27 +4,31 @@ Scripts to drive a donkey 2 car and train a model for it.
 
 Usage:
     manage.py (drive) [--model=<model>] [--js]
-    manage.py (train) [--tub=<tub1,tub2,..tubn>] (--model=<model>)
+    manage.py (train) [--tub=<tub1,tub2,..tubn>]  (--model=<model>) [--no_cache]
+    manage.py (sim) (--model=<model>) [--top_speed=<5>]
 
 Options:
-    -h --help     Show this screen.
-    --js          Use physical joystick.
-    --fix         Remove records which cause problems.
-
+    -h --help        Show this screen.
+    --tub TUBPATHS   List of paths to tubs. Comma separated. Use quotes to use wildcards. ie "~/tubs/*"
+    --js             Use physical joystick.
 """
+from numpy.random import seed
+seed(1)
+from tensorflow import set_random_seed
+set_random_seed(2)
 import os
 from docopt import docopt
+
 import donkeycar as dk
 
 #import parts
 from donkeycar.parts.camera import PiCamera
 from donkeycar.parts.transform import Lambda
-from donkeycar.parts.keras import KerasCategorical, KerasLinear
 from donkeycar.parts.actuator import PCA9685, PWMSteering, PWMThrottle
 from donkeycar.parts.datastore import TubHandler, TubGroup
 from donkeycar.parts.controller import LocalWebController, JoystickController
-from donkeycar.parts.cv import ImgStack
-
+import numpy as np
+from custom_train import custom_train, sim
 
 def drive(cfg, model_path=None, use_joystick=False):
     '''
@@ -41,31 +45,26 @@ def drive(cfg, model_path=None, use_joystick=False):
     V = dk.vehicle.Vehicle()
     cam = PiCamera(resolution=cfg.CAMERA_RESOLUTION)
     V.add(cam, outputs=['cam/image_array'], threaded=True)
-
-    #this part stacks the last 3 images into channels of a single output image
-    img_stack = ImgStack()
-    V.add(img_stack, 
-        inputs=['cam/image_array'],
-        outputs=['img_stack'])
     
     if use_joystick or cfg.USE_JOYSTICK_AS_DEFAULT:
         #modify max_throttle closer to 1.0 to have more power
         #modify steering_scale lower than 1.0 to have less responsive steering
         ctr = JoystickController(max_throttle=cfg.JOYSTICK_MAX_THROTTLE,
-                                    steering_scale=cfg.JOYSTICK_STEERING_SCALE,
-                                    auto_record_on_throttle=cfg.AUTO_RECORD_ON_THROTTLE)
+                                 steering_scale=cfg.JOYSTICK_STEERING_SCALE,
+                                 auto_record_on_throttle=cfg.AUTO_RECORD_ON_THROTTLE)
     else:        
         #This web controller will create a web server that is capable
         #of managing steering, throttle, and modes, and more.
         ctr = LocalWebController()
+
     
     V.add(ctr, 
-          inputs=['img_stack'],
+          inputs=['cam/image_array'],
           outputs=['user/angle', 'user/throttle', 'user/mode', 'recording'],
           threaded=True)
     
     #See if we should even run the pilot module. 
-    #This is only needed because the part run_contion only accepts boolean
+    #This is only needed because the part run_condition only accepts boolean
     def pilot_condition(mode):
         if mode == 'user':
             return False
@@ -80,7 +79,7 @@ def drive(cfg, model_path=None, use_joystick=False):
     if model_path:
         kl.load(model_path)
     
-    V.add(kl, inputs=['img_stack'], 
+    V.add(kl, inputs=['cam/image_array'], 
           outputs=['pilot/angle', 'pilot/throttle'],
           run_condition='run_pilot')
     
@@ -120,12 +119,8 @@ def drive(cfg, model_path=None, use_joystick=False):
     V.add(throttle, inputs=['throttle'])
     
     #add tub to save data
-    inputs=['cam/image_array',
-            'user/angle', 'user/throttle', 
-            'user/mode']
-    types=['image_array',
-           'float', 'float',  
-           'str']
+    inputs=['cam/image_array', 'user/angle', 'user/throttle', 'user/mode']
+    types=['image_array', 'float', 'float',  'str']
     
     th = TubHandler(path=cfg.DATA_PATH)
     tub = th.new_tub_writer(inputs=inputs, types=types)
@@ -139,62 +134,23 @@ def drive(cfg, model_path=None, use_joystick=False):
 
 
 
-
-def train(cfg, tub_names, model_name):
-    '''
-    use the specified data in tub_names to train an artifical neural network
-    saves the output trained model as model_name
-    '''
-    X_keys = ['cam/image_array']
-    y_keys = ['user/angle', 'user/throttle']
-
-    #use these offsets from the current frame as points to learn the future
-    #steering values.
-    frames = [0, 20, 40, 120]
-
-    new_y_keys = []
-    for iFrame in frames:
-        for key in y_keys:
-            new_y_keys.append(key + "_" + str(iFrame))
-
-    y_keys = new_y_keys
-    
-    kl = KerasLinear(num_outputs=len(y_keys))
-
-    tubgroup = TubGroup(tub_names)
-    train_gen, val_gen = tubgroup.get_train_val_gen(X_keys, y_keys,
-                                                    batch_size=cfg.BATCH_SIZE,
-                                                    train_frac=cfg.TRAIN_TEST_SPLIT)
-
-    model_path = os.path.expanduser(model_name)
-
-    total_records = len(tubgroup.df)
-    total_train = int(total_records * cfg.TRAIN_TEST_SPLIT)
-    total_val = total_records - total_train
-    print('train: %d, validation: %d' % (total_train, total_val))
-    steps_per_epoch = total_train // cfg.BATCH_SIZE
-    print('steps_per_epoch', steps_per_epoch)
-
-    kl.train(train_gen,
-        val_gen,
-        saved_model_path=model_path,
-        steps=steps_per_epoch,
-        train_split=cfg.TRAIN_TEST_SPLIT)
-
-
 if __name__ == '__main__':
     args = docopt(__doc__)
     cfg = dk.load_config()
     
     if args['drive']:
         drive(cfg, model_path = args['--model'], use_joystick=args['--js'])
-    
+
     elif args['train']:
         tub = args['--tub']
         model = args['--model']
-        train(cfg, tub, model)
+        cache = not args['--no_cache']
+        custom_train(cfg, tub, model)
 
-
+    elif args['sim']:
+        model = args['--model']
+        top_speed = args['--top_speed']
+        sim(cfg, model, top_speed)
 
 
 
